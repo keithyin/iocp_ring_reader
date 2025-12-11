@@ -20,9 +20,17 @@ use windows_sys::Win32::System::Threading::INFINITE;
 
 use crate::utils::str_to_wide;
 
+#[derive(Debug, Default, Clone, Copy)]
+struct DataPos {
+    buf_idx: usize,
+    offset: usize
+}
+
 pub struct Reader {
     handle: *mut c_void,
-    iocp: *mut c_void
+    iocp: *mut c_void,
+    buffers: Vec<crate::buffer::Buffer>,
+    data_pos: DataPos
 }
 
 impl Reader {
@@ -53,6 +61,6 @@ impl Reader {
         };
 
 
-        Self { handle: handle, iocp: iocp }
+        Self { handle: handle, iocp: iocp , buffers: vec![], data_pos: DataPos::default()}
     }
 }
