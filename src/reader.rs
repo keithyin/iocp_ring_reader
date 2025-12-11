@@ -5,7 +5,6 @@ use std::ffi::{OsStr, c_void};
 use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
-use std::ptr::{null, null_mut};
 use std::slice;
 use windows_sys::Win32::Foundation::{BOOL, GENERIC_READ};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
