@@ -1,19 +1,14 @@
 #![allow(non_snake_case)]
-use std::boxed::Box;
-use std::convert::TryInto;
-use std::ffi::{OsStr, c_void};
-use std::io::{self, Write};
-use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStrExt;
-use std::slice;
-use windows_sys::Win32::Foundation::{BOOL, GENERIC_READ};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use std::ffi::c_void;
+use std::io::{Read, Seek};
+use windows_sys::Win32::Foundation::GENERIC_READ;
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
+    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
 };
 use windows_sys::Win32::System::Threading::INFINITE;
 
@@ -27,6 +22,7 @@ struct DataPos {
 }
 
 pub struct SequentialReader {
+    fpath: String,
     handle: *mut c_void,
     iocp: *mut c_void,
     buffers: Vec<crate::buffer::Buffer>,
@@ -44,11 +40,11 @@ impl SequentialReader {
         assert!(buffer_size % 4096 == 0);
 
         let file_size = get_file_size(fpath);
-        let fpath = str_to_wide(fpath);
+        let fpath_wide = str_to_wide(fpath);
 
         let handle = unsafe {
             CreateFileW(
-                fpath.as_ptr(),
+                fpath_wide.as_ptr(),
                 GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
@@ -87,6 +83,7 @@ impl SequentialReader {
             .map(|idx| Buffer::new(buffer_size, idx))
             .collect();
         Self {
+            fpath: fpath.to_string(),
             handle: handle,
             iocp: iocp,
             buffers: buffers,
@@ -100,14 +97,20 @@ impl SequentialReader {
         }
     }
 
-    pub fn read2buf(&mut self, buf: &mut [u8]) {
+    pub fn read2buf(&mut self, buf: &mut [u8]) -> usize {
         let req_len = buf.len();
-        self.wait_inner_buf_ready();
         let mut remaining_bytes = req_len;
-
         let mut fill_pos = 0;
+
         while remaining_bytes > 0 {
-            let cur_buf_read_n = remaining_bytes.min(self.buffer_size - self.data_pos.offset);
+            self.wait_inner_buf_ready();
+            if self.buffers_status[self.data_pos.buf_idx] == ReaderBufferStatus::Invalid {
+                return fill_pos;
+            }
+
+            let cur_buf_read_n =
+                remaining_bytes.min(self.buffers[self.data_pos.buf_idx].len - self.data_pos.offset);
+
             unsafe {
                 std::ptr::copy(
                     self.buffers[self.data_pos.buf_idx]
@@ -122,18 +125,17 @@ impl SequentialReader {
             fill_pos += cur_buf_read_n;
             remaining_bytes -= cur_buf_read_n;
 
-            if self.data_pos.offset == self.buffer_size {
+            if self.data_pos.offset == self.buffers[self.data_pos.buf_idx].len {
+                self.buffers_status[self.data_pos.buf_idx] = ReaderBufferStatus::Ready4Submit;
                 self.submit_read_event(self.data_pos.buf_idx);
 
                 self.data_pos.buf_idx += 1;
                 self.data_pos.buf_idx %= self.buffers.len();
                 self.data_pos.offset = 0;
             }
-
-            if remaining_bytes > 0 {
-                self.wait_inner_buf_ready();
-            }
         }
+
+        return req_len;
     }
 
     fn wait_inner_buf_ready(&mut self) -> Option<()> {
@@ -167,6 +169,11 @@ impl SequentialReader {
             }
 
             let task: *mut Buffer = pov as *mut Buffer;
+            unsafe {
+                (*task).len = bytes_transferred as usize;
+            }
+
+            assert_eq!(bytes_transferred, self.buffer_size as u32);
             let idx = unsafe { (*task).idx };
             self.buffers_status[idx] = ReaderBufferStatus::Ready4Read;
             self.pendding -= 1;
@@ -184,14 +191,37 @@ impl SequentialReader {
             return;
         }
 
-        if (self.file_pos_cursor + self.buffer_size as u64) >= self.file_size {
+        if (self.file_pos_cursor + self.buffer_size as u64) > self.file_size {
             // use other method to read the remaining data
+
+            // println!("...HERE...");
+            let mut f = std::fs::File::open(&self.fpath).unwrap();
+            f.seek(std::io::SeekFrom::Start(self.file_pos_cursor))
+                .unwrap();
+            let remaining_bytes = (self.file_size - self.file_pos_cursor) as usize;
+            let buf_slice = unsafe {
+                std::slice::from_raw_parts_mut(self.buffers[buf_idx].data, remaining_bytes)
+            };
+            f.read_exact(buf_slice).unwrap();
+            self.buffers[buf_idx].len = remaining_bytes;
+
+            self.file_pos_cursor += remaining_bytes as u64;
+            assert_eq!(self.file_pos_cursor, self.file_size);
             return;
         }
 
         let lo = (self.file_pos_cursor & 0xFFFF_FFFF) as u32;
         let hi = (self.file_pos_cursor >> 32) as u32;
+
         // self.buffers[buf_idx].overlapped.Pointer = std::ptr::null_mut(); // not used
+        unsafe {
+            std::ptr::write_bytes(
+                &mut self.buffers[buf_idx].overlapped as *mut OVERLAPPED,
+                0,
+                1,
+            );
+        }
+
         self.buffers[buf_idx].overlapped.Anonymous.Pointer = std::ptr::null_mut();
 
         self.buffers[buf_idx].overlapped.Anonymous.Anonymous.Offset = lo;
@@ -239,4 +269,20 @@ impl Drop for SequentialReader {
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use crate::reader::SequentialReader;
+
+    #[test]
+    fn test_sequential_reader() {
+        let mut reader = SequentialReader::new("test_data/data.txt", 0, 4096, 2);
+        let mut buf = vec![0_u8; 4096];
+        loop {
+            let n = reader.read2buf(&mut buf);
+            if n == 0 {
+                break;
+            }
+            print!("{}", String::from_utf8((&buf[..n]).to_vec()).unwrap());
+        }
+        
+    }
+}
